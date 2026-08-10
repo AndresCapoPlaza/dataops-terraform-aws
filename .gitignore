@@ -1,0 +1,27 @@
+# ==============================================================================
+# ESTADO LOCAL DE TERRAFORM
+# Nunca guardes el .tfstate local en Git; usaremos S3 para eso.
+# ==============================================================================
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+# Carpeta interna de trabajo de Terraform (contiene binarios de los providers)
+.terraform/
+# Archivo de bloqueo de versiones de providers
+# .terraform.lock.hcl
+# ==============================================================================
+# ARCHIVOS DE VARIABLES Y SECRETOS
+# Contienen credenciales, tokens o variables sensibles específicas.
+# ==============================================================================
+*.tfvars
+*.auto.tfvars
+tfvars.json
+# Archivos de llaves privadas y credenciales de AWS
+aws_credentials
+*.pem
+# ==============================================================================
+# ARCHIVOS TEMPORALES Y DE EDITORES DE CÓDIGO
+# ==============================================================================
+.DS_Store
+.vscode/
+.idea/
