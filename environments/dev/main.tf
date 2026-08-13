@@ -21,3 +21,14 @@ module "identity" {
   bucket_arn  = aws_s3_bucket.raw_bucket.arn
   prefix      = "raw-data/*"
 }
+
+module "kinesis" {
+  source = "./modules/kinesis"
+
+  environment        = var.environment
+  stream_name        = "clicks-ecommerce"
+  shard_count        = 2
+  bucket_name        = aws_s3_bucket.raw_bucket.bucket
+  buffer_size_mb     = 5
+  buffer_interval_sec = 60
+}
