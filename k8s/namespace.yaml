@@ -1,0 +1,7 @@
+##==================================================
+## ESPACIO AISLADO DONDE CORRERA LA PLATAFORMA
+##==================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: urban-data

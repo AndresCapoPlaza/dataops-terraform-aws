@@ -1,0 +1,13 @@
+## ========================================
+## variables de entorno de Kafka y Spark.
+## ========================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: urban-platform-config
+  namespace: urban-data
+data:
+  KAFKA_TOPIC: "urban_sensors"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  SPARK_APP_NAME: "urban-sensor-stream"
+  SPARK_WINDOW_SECONDS: "60"

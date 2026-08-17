@@ -523,3 +523,182 @@ Como evidencia de la implementación se dispone de:
 - boto3
 - PowerShell
 - Git / GitHub
+
+# DataOps - Entrega 3
+
+## 1. Descripción del proyecto
+
+En esta tercera entrega se implementó una plataforma de procesamiento
+distribuido en tiempo real utilizando Kubernetes como orquestador,
+Apache Kafka como bus de eventos y Apache Spark Structured Streaming
+para el procesamiento de métricas de sensores urbanos.
+
+---
+
+## 2. Arquitectura implementada
+
+```mermaid
+flowchart LR
+    P[Productor Python<br/>producer_kafka.py] -->|JSON: sensor_id, temperature,<br/>humidity, air_quality_index, timestamp| K[Apache Kafka<br/>topic: urban_sensors<br/>3 particiones]
+    K --> S[Spark Structured Streaming<br/>spark_streaming.py]
+    S -->|Window 1 min<br/>avg por sensor_id| O[Salida por consola<br/>avg_temperature, avg_air_quality_index]
+
+    subgraph K8s[Kubernetes - namespace urban-data]
+        K
+        S
+    end
+```
+
+Componentes:
+
+- Namespace dedicado `urban-data`
+- ConfigMap para variables de entorno de Kafka y Spark
+- Deployment + Service de Kafka
+- Deployment de Spark (Structured Streaming)
+- Productor Python (fuera del cluster, vía port-forward)
+
+---
+
+## 3. Infraestructura Kubernetes
+
+Los manifiestos se encuentran en `k8s/`:
+
+```text
+k8s/
+├── namespace.yaml
+├── configmap.yaml
+├── kafka.yaml
+├── kafka-service.yaml
+└── spark.yaml
+```
+
+Despliegue, en orden:
+
+```powershell
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/kafka.yaml
+kubectl apply -f k8s/kafka-service.yaml
+kubectl apply -f k8s/spark.yaml
+```
+
+Verificación:
+
+```powershell
+kubectl get pods -n urban-data
+kubectl get svc -n urban-data
+```
+
+---
+
+## 4. Kafka - Tópico urban_sensors
+
+Se creó el tópico `urban_sensors` con 3 particiones:
+
+```powershell
+kubectl exec -it <pod-kafka> -n urban-data -- bash
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic urban_sensors
+```
+
+```text
+Topic: urban_sensors   PartitionCount: 3   ReplicationFactor: 1
+```
+
+---
+
+## 5. Productor Kafka
+
+Archivo: `producers/producer_kafka.py`
+
+El productor genera eventos JSON simulando sensores urbanos y los envía
+al tópico `urban_sensors`:
+
+```json
+{
+  "sensor_id": "sensor-001",
+  "temperature": 23.45,
+  "humidity": 60.12,
+  "air_quality_index": 85,
+  "timestamp": "2026-08-17T22:06:25.217082+00:00"
+}
+```
+
+Para conectar desde fuera del cluster, se expone el servicio mediante
+port-forward:
+
+```powershell
+kubectl port-forward svc/kafka -n urban-data 29092:29092
+```
+
+Ejecución del productor:
+
+```powershell
+python producers/producer_kafka.py
+```
+
+---
+
+## 6. Procesamiento con Spark Structured Streaming
+
+Archivo: `spark/spark_streaming.py`
+
+El job consume del tópico `urban_sensors`, parsea el JSON según schema,
+y calcula agregaciones mediante ventana de tiempo (windowing) de 1 minuto:
+
+- Promedio de `temperature` por `sensor_id`
+- Promedio de `air_quality_index` por `sensor_id`
+
+Ejecución dentro del cluster:
+
+```powershell
+kubectl logs -f <pod-spark> -n urban-data
+```
+
+---
+
+## 7. Evidencia de comunicación Kafka - Spark
+
+La siguiente captura muestra, en simultáneo:
+
+- El productor enviando eventos JSON al tópico `urban_sensors`
+- Spark procesando los datos y calculando el promedio de temperatura
+  y calidad del aire agrupado por `sensor_id`, en ventanas de 1 minuto
+
+![Evidencia Kafka-Spark](evidence/kafka-spark-evidence.png)
+
+---
+
+## 8. Estructura del proyecto (Entrega 3)
+
+```text
+mi-proyecto-dataops/
+│
+├── k8s/
+│   ├── namespace.yaml
+│   ├── configmap.yaml
+│   ├── kafka.yaml
+│   ├── kafka-service.yaml
+│   └── spark.yaml
+│
+├── producers/
+│   └── producer_kafka.py
+│
+├── spark/
+│   └── spark_streaming.py
+│
+├── evidence/
+│   └── kafka-spark-evidence.png
+│
+└── README.md
+```
+
+---
+
+## 9. Tecnologías utilizadas
+
+- Kubernetes (Docker Desktop)
+- Apache Kafka
+- Apache Spark Structured Streaming
+- Python (kafka-python)
+- PySpark
+- Git / GitHub
