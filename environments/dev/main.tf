@@ -32,3 +32,18 @@ module "kinesis" {
   buffer_size_mb     = 5
   buffer_interval_sec = 60
 }
+
+
+module "flink" {
+  source = "./modules/flink"
+
+  environment           = var.environment
+  app_name              = "clicks-processor"
+  kinesis_stream_arn    = module.kinesis.stream_arn
+  kinesis_stream_name   = "clicks-ecommerce"
+  code_bucket_arn       = aws_s3_bucket.raw_bucket.arn
+  code_bucket_name      = aws_s3_bucket.raw_bucket.bucket
+  code_s3_key           = "flink/clicks_processor.zip"
+  checkpoint_bucket_arn = aws_s3_bucket.raw_bucket.arn
+  region                = "us-east-1"
+}

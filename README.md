@@ -1,4 +1,5 @@
-# DataOps con Terraform & AWS
+# DataOps - Entrega 1
+## DataOps con Terraform & AWS
 
 ## Checkpoint de Infraestructura Base
 
@@ -701,4 +702,189 @@ mi-proyecto-dataops/
 - Apache Spark Structured Streaming
 - Python (kafka-python)
 - PySpark
+- Git / GitHub
+
+
+---
+
+# DataOps - Entrega 4
+
+## 1. Descripción del proyecto
+
+En esta cuarta entrega se implementó la capa de procesamiento en tiempo real
+utilizando Amazon Managed Service for Apache Flink, consumiendo del Kinesis
+Data Stream `clicks-ecommerce` creado en el Módulo 2.
+
+## 2. Lógica de negocio
+
+La aplicación procesa eventos de clicks de e-commerce con la siguiente estructura:
+
+```json
+{
+  "event_id": "uuid",
+  "user_id": "user-1",
+  "event_type": "click",
+  "product_id": "product-1",
+  "timestamp": "2026-08-23T22:53:58.123456+00:00"
+}
+```
+
+**Lógica implementada:** conteo de clics por producto (`product_id`) en
+ventanas de tiempo *Tumbling Event Time* de 1 minuto, usando estado por clave
+(`KeyedState`). Esto permite identificar qué productos concentran más
+actividad en cada intervalo de tiempo, en tiempo real.
+
+## 3. Arquitectura
+
+```mermaid
+flowchart LR
+    P[Productor Python<br/>producer_kinesis.py] -->|JSON: event_id, user_id,<br/>event_type, product_id, timestamp| K[Kinesis Data Stream<br/>clicks-ecommerce]
+    K --> F[Managed Service<br/>for Apache Flink]
+    F -->|Tumbling Window 1 min<br/>conteo por product_id| O[Output: conteo de clics<br/>por producto y ventana]
+    F -.->|Checkpoints| S3C[(S3 - Checkpoints)]
+    F -.->|Código .zip| S3CODE[(S3 - Código de la app)]
+```
+
+## 4. Watermarks y Event Time
+
+Se implementó un `WatermarkStrategy` con las siguientes características:
+
+- **Tolerancia a desorden:** `for_bounded_out_of_orderness(10 segundos)`,
+  para absorber la latencia natural de red entre el productor y Kinesis.
+- **Detección de inactividad:** `with_idleness(20 segundos)`, para que las
+  ventanas se cierren igual aunque el productor deje de enviar eventos.
+- **Extracción de timestamp:** se usa el campo `timestamp` del evento
+  (event time), no el reloj del sistema (processing time), para reflejar
+  cuándo ocurrió el click realmente.
+
+## 5. Código de la aplicación
+
+Archivo: `flink/clicks_processor.py`
+
+Componentes principales:
+
+- `FlinkKinesisConsumer`: consume del stream `clicks-ecommerce`.
+- `ParseClickEvent` (MapFunction): parsea el JSON y extrae `(product_id, timestamp_ms, 1)`.
+- `ClickTimestampAssigner`: asigna el event time para el watermark.
+- `key_by(product_id)` + `TumblingEventTimeWindows.of(1 minuto)` + `SumClicks` (ReduceFunction):
+  agrega el conteo de clics por producto y por ventana (estado por clave).
+
+## 6. Infraestructura como código (Terraform)
+
+Nuevo módulo: `environments/dev/modules/flink/`
+
+Recursos definidos:
+
+- `aws_kinesisanalyticsv2_application`: la aplicación de Flink en sí,
+  configurada en runtime `FLINK-1_15`, con el código apuntando al `.zip`
+  en S3.
+- `aws_iam_role` + 4 políticas IAM acotadas: permisos específicos para leer
+  del stream de Kinesis, leer el código desde S3, leer/escribir checkpoints
+  en S3, y escribir logs en CloudWatch (principio de mínimo privilegio).
+- `checkpoint_configuration`: checkpointing habilitado (`checkpointing_enabled = true`),
+  con intervalo de 60 segundos, para garantizar recuperación de estado ante fallos.
+- `monitoring_configuration`: nivel de log `INFO` y métricas a nivel `APPLICATION`.
+- `parallelism_configuration`: paralelismo de 1 (ajustable vía `parallelism_per_kpu`
+  según la carga esperada).
+- `aws_cloudwatch_log_group` / `aws_cloudwatch_log_stream`: destino de logs de la app.
+
+### Despliegue (infraestructura definida, no aplicada en este entorno)
+
+```powershell
+cd environments/dev
+terraform init
+terraform validate
+terraform plan
+```
+
+> **Nota:** por motivos de costo (Managed Service for Apache Flink cobra por
+> KPU-hora de forma continua), la infraestructura fue validada con
+> `terraform plan` (0 errores, 8 recursos a crear) pero no desplegada de
+> forma persistente en este entorno. La lógica de procesamiento fue
+> validada localmente contra el stream real de Kinesis en AWS (ver
+> evidencia más abajo).
+
+## 7. Empaquetado del código
+
+```powershell
+Compress-Archive -Path flink\clicks_processor.py -DestinationPath flink\clicks_processor.zip -Force
+```
+
+El resultado (`flink/clicks_processor.zip`) es el artefacto que
+`aws_kinesisanalyticsv2_application` espera encontrar en S3
+(`code_content.s3_content_location`).
+
+## 8. Validación local contra Kinesis real
+
+Para verificar que la lógica de Flink funciona correctamente antes de
+desplegarla, se ejecutó el job localmente con PyFlink, consumiendo
+directamente del stream `clicks-ecommerce` ya desplegado en AWS:
+
+```powershell
+python flink\clicks_processor.py
+```
+
+En paralelo, se ejecutó el productor real:
+
+```powershell
+python producers\producer_kinesis.py
+```
+
+## 9. Evidencia de ejecución
+
+La siguiente captura muestra, en simultáneo:
+
+- El productor enviando 100 eventos de clicks al stream `clicks-ecommerce`
+- Flink procesando los eventos y calculando el conteo de clics por
+  `product_id` en la ventana Tumbling de 1 minuto
+
+![Evidencia Flink-Kinesis](evidence/flink-kinesis-evidence.png)
+
+## 10. Requisitos adicionales (setup local)
+
+Para reproducir la validación local se necesita:
+
+```powershell
+pip install apache-flink==1.18.1
+winget install EclipseAdoptium.Temurin.11.JDK
+```
+
+Descargar el conector de Kinesis para Flink (no se versiona en el repo por su tamaño):
+
+```powershell
+mkdir flink\lib
+Invoke-WebRequest -Uri "https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kinesis/1.15.4/flink-sql-connector-kinesis-1.15.4.jar" -OutFile "flink\lib\flink-sql-connector-kinesis-1.15.4.jar"
+```
+
+## 11. Estructura del proyecto (Entrega 4)
+
+```text
+mi-proyecto-dataops/
+│
+├── flink/
+│   ├── clicks_processor.py
+│   ├── clicks_processor.zip
+│   └── lib/                          (no versionado, ver .gitignore)
+│       └── flink-sql-connector-kinesis-1.15.4.jar
+│
+├── environments/dev/modules/flink/
+│   ├── main.tf
+│   ├── variables.tf
+│   └── output.tf
+│
+├── evidence/
+│   └── flink-kinesis-evidence.png
+│
+└── README.md
+```
+
+## 12. Tecnologías utilizadas
+
+- Amazon Managed Service for Apache Flink
+- Apache Flink 1.15 (PyFlink)
+- Amazon Kinesis Data Streams
+- AWS IAM
+- Amazon CloudWatch
+- Terraform
+- Python + boto3
 - Git / GitHub

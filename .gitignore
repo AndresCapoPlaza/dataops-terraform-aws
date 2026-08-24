@@ -45,3 +45,7 @@ aws_credentials
 **/*accessKeys.csv
 **/*credentials.csv
 *.csv
+# ==============================================================================
+# Conectores JAR descargados (no versionar, se descargan en el setup)
+# ==============================================================================
+flink/lib/*.jar
