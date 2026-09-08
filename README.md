@@ -888,3 +888,102 @@ mi-proyecto-dataops/
 - Terraform
 - Python + boto3
 - Git / GitHub
+
+---
+
+# DataOps - Entrega 5
+
+## 1. Descripción del proyecto
+
+En esta quinta entrega se implementó la capa de almacenamiento y catálogo
+(Lakehouse), transformando la salida del pipeline de Flink en una tabla
+transaccional de Apache Iceberg, registrada y gobernada por AWS Glue Data
+Catalog.
+
+## 2. Arquitectura
+
+```mermaid
+flowchart LR
+    P[Productor Python<br/>producer_kinesis.py] --> K[Kinesis Data Stream<br/>clicks-ecommerce]
+    K --> F[Flink<br/>Table API + SQL]
+    F -->|Tumbling Window 1 min<br/>conteo por product_id| I[(Tabla Iceberg<br/>clicks_by_product)]
+    I -.->|Metadata + Schema| G[AWS Glue<br/>Data Catalog]
+    I -->|Archivos .parquet| S3[(S3 - Lakehouse)]
+```
+
+## 3. Infraestructura como código (Terraform)
+
+Nuevo módulo: `environments/dev/modules/glue/`
+
+Recursos definidos:
+
+- `aws_glue_catalog_database` (`lakehouse_db`): contenedor lógico de las
+  tablas Iceberg.
+- Permisos IAM ampliados para el rol de ejecución de Flink:
+  `glue:GetDatabase`, `glue:GetTable`, `glue:CreateTable`, `glue:UpdateTable`,
+  `glue:DeleteTable`, `glue:GetPartitions`, `glue:BatchCreatePartition`.
+- Permisos de lectura/escritura extendidos en el bucket S3 designado para
+  el Lakehouse (prefijo `lakehouse/`).
+
+## 4. Estrategia de particionado
+
+La tabla `clicks_by_product` está **particionada por `product_id`**.
+
+Se eligió esta estrategia porque las consultas más frecuentes sobre esta
+tabla van a filtrar o agrupar por producto (por ejemplo: "¿cuántos clics
+tuvo el producto X en la última hora?"). Con el particionado por
+`product_id`, Iceberg puede aplicar **partition pruning**: al ejecutar una
+consulta con un filtro `WHERE product_id = 'product-5'`, el motor descarta
+directamente todos los archivos de datos de las demás particiones sin
+necesidad de leerlos, reduciendo drásticamente el volumen de I/O y el
+tiempo de respuesta. Esto es especialmente valioso a medida que la tabla
+crece con más ventanas de tiempo acumuladas.
+
+## 5. Implementación en Flink
+
+Archivo: `flink/iceberg_processor.py`
+
+- Se define una tabla fuente sobre el stream `clicks-ecommerce` usando el
+  conector `kinesis` en modo `raw`, extrayendo los campos del JSON con
+  `JSON_VALUE` directamente en SQL.
+- Se define el catálogo Iceberg respaldado por Glue:
+  `'catalog-impl' = 'org.apache.iceberg.aws.glue.GlueCatalog'`.
+- Se crea la tabla Iceberg `clicks_by_product` particionada por
+  `product_id`.
+- Se ejecuta un `INSERT INTO` continuo que agrega los clics por producto
+  en ventanas Tumbling de 1 minuto.
+- **Checkpointing habilitado** (`env.enable_checkpointing(30000)`): el
+  Iceberg Sink solo confirma (hace commit) los archivos de datos cuando
+  Flink completa un checkpoint. Sin esto, los datos quedarían escritos en
+  S3 pero la tabla nunca reflejaría los cambios en el catálogo.
+
+## 6. Prueba de persistencia
+
+Se ejecutó el job localmente contra el stream real de Kinesis y el
+catálogo de Glue real en AWS, confirmando:
+
+- Generación de archivos `.parquet` particionados por `product_id` en S3.
+- Archivos de metadata (`*.metadata.json`) y snapshots (`snap-*.avro`)
+  actualizándose en cada checkpoint.
+- La tabla visible y consultable desde la consola de AWS Glue, con el
+  schema correcto (`product_id: string`, `window_end: timestamp`,
+  `click_count: bigint`).
+
+## 7. Evidencia
+
+La siguiente captura muestra la tabla `clicks_by_product` en la consola
+de AWS Glue, con formato Apache Iceberg, base de datos `lakehouse_db`,
+ubicación en S3 y el schema completo:
+
+![Tabla Iceberg en AWS Glue](evidence/glue-iceberg-table.png)
+
+## 8. Tecnologías utilizadas
+
+- Apache Iceberg
+- AWS Glue Data Catalog
+- Amazon S3 (Lakehouse)
+- Apache Flink (Table API + SQL)
+- Amazon Kinesis Data Streams
+- Terraform
+- Python + boto3
+- Git / GitHub

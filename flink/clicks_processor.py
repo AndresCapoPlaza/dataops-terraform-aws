@@ -46,8 +46,8 @@ class ClickTimestampAssigner(TimestampAssigner):
 def main():
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
-    env.add_jars("file:///C:/Users/Usuario/Desktop/Nueva%20carpeta/.data11/mi-proyecto-dataops/flink/lib/flink-sql-connector-kinesis-1.15.4.jar")
-
+    #env.add_jars("file:///C:/Users/Usuario/Desktop/Nueva%20carpeta/.data11/mi-proyecto-dataops/flink/lib/flink-sql-connector-kinesis-1.15.4.jar")
+    
     # Configuración del consumidor de Kinesis
     consumer_config = {
         "aws.region": REGION,
@@ -89,10 +89,12 @@ def main():
         .reduce(SumClicks())
     )
 
-    with result_stream.execute_and_collect() as results:
-        for result in results:
-            print(f"Resultado: producto={result[0]} | ventana_fin={result[1]} | clics={result[2]}")
+    # with result_stream.execute_and_collect() as results:
+        # for result in results:
+            # print(f"Resultado: producto={result[0]} | ventana_fin={result[1]} | clics={result[2]}")
 
+    result_stream.print()
 
+    env.execute("clicks-por-producto-tumbling-1min")
 if __name__ == "__main__":
     main()

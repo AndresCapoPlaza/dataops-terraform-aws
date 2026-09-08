@@ -49,3 +49,4 @@ aws_credentials
 # Conectores JAR descargados (no versionar, se descargan en el setup)
 # ==============================================================================
 flink/lib/*.jar
+flink/lib_iceberg/*.jar 

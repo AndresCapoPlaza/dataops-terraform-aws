@@ -17,3 +17,8 @@ output "flink_log_group_name" {
   description = "Nombre del CloudWatch Log Group de Flink"
   value       = aws_cloudwatch_log_group.flink_log_group.name
 }
+
+output "flink_execution_role_name" {
+  description = "Nombre del rol de ejecución de Flink"
+  value       = aws_iam_role.flink_execution_role.name
+}

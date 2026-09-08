@@ -47,3 +47,12 @@ module "flink" {
   checkpoint_bucket_arn = aws_s3_bucket.raw_bucket.arn
   region                = "us-east-1"
 }
+
+module "glue" {
+  source = "./modules/glue"
+
+  flink_execution_role_id = module.flink.flink_execution_role_name
+  lakehouse_bucket_arn    = aws_s3_bucket.raw_bucket.arn
+  region                  = "us-east-1"
+  account_id              = "010798385513"
+}

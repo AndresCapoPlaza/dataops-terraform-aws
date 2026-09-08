@@ -159,7 +159,7 @@ resource "aws_kinesisanalyticsv2_application" "clicks_processor" {
       property_group {
         property_group_id = "kinesis.analytics.flink.run.options"
         property_map = {
-          python = var.code_s3_key
+          python = "clicks_processor.py"
         }
       }
 
