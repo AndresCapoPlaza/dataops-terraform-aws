@@ -48,5 +48,15 @@ aws_credentials
 # ==============================================================================
 # Conectores JAR descargados (no versionar, se descargan en el setup)
 # ==============================================================================
-flink/lib/*.jar
-flink/lib_iceberg/*.jar 
+app/flink/lib/*.jar
+app/flink/lib_iceberg/*.jar
+
+# ==============================================================================
+# ARTEFACTOS LOCALES DE EJECUCION
+# ==============================================================================
+
+__pycache__/
+*.pyc
+*.bak
+flink_run*.log
+_local/

@@ -14,6 +14,19 @@ resource "aws_s3_bucket" "raw_bucket" {
     ManagedBy   = "Terraform"
   }
 }
+
+
+resource "aws_s3_bucket_versioning" "raw_bucket_versioning" {
+  bucket = aws_s3_bucket.raw_bucket.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+
+
+
+
 # 3. Invocación del Módulo IAM Acotado
 module "identity" {
   source      = "./modules/identity"
@@ -21,6 +34,7 @@ module "identity" {
   bucket_arn  = aws_s3_bucket.raw_bucket.arn
   prefix      = "raw-data/*"
 }
+
 
 module "kinesis" {
   source = "./modules/kinesis"
@@ -54,5 +68,4 @@ module "glue" {
   flink_execution_role_id = module.flink.flink_execution_role_name
   lakehouse_bucket_arn    = aws_s3_bucket.raw_bucket.arn
   region                  = "us-east-1"
-  account_id              = "010798385513"
 }

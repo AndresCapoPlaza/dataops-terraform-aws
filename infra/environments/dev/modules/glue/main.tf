@@ -1,4 +1,10 @@
 # ============================================================
+# Identidad de la cuenta (evita hardcodear el account_id)
+# ============================================================
+
+data "aws_caller_identity" "current" {}
+
+# ============================================================
 # Base de datos en AWS Glue Data Catalog (Lakehouse)
 # ============================================================
 
@@ -31,9 +37,9 @@ resource "aws_iam_role_policy" "flink_glue_access" {
           "glue:BatchCreatePartition",
         ]
         Resource = [
-          "arn:aws:glue:${var.region}:${var.account_id}:catalog",
-          "arn:aws:glue:${var.region}:${var.account_id}:database/${aws_glue_catalog_database.lakehouse_db.name}",
-          "arn:aws:glue:${var.region}:${var.account_id}:table/${aws_glue_catalog_database.lakehouse_db.name}/*",
+          "arn:aws:glue:${var.region}:${data.aws_caller_identity.current.account_id}:catalog",
+          "arn:aws:glue:${var.region}:${data.aws_caller_identity.current.account_id}:database/${aws_glue_catalog_database.lakehouse_db.name}",
+          "arn:aws:glue:${var.region}:${data.aws_caller_identity.current.account_id}:table/${aws_glue_catalog_database.lakehouse_db.name}/*",
         ]
       }
     ]
@@ -63,6 +69,53 @@ resource "aws_iam_role_policy" "flink_lakehouse_s3_access" {
           var.lakehouse_bucket_arn,
           "${var.lakehouse_bucket_arn}/*",
         ]
+      }
+    ]
+  })
+}
+
+
+# ============================================================
+# Lock manager para commits concurrentes de Iceberg
+# GlueCatalog usa optimistic locking nativo (version-id de Glue).
+# Esta tabla DynamoDB agrega un lock explicito para escenarios
+# multi-writer -> criterio "cero errores de concurrencia".
+# ============================================================
+
+resource "aws_dynamodb_table" "iceberg_glue_lock" {
+  name         = "iceberg_glue_lock"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "entityId"
+
+  attribute {
+    name = "entityId"
+    type = "S"
+  }
+
+  tags = {
+    Name      = "iceberg-glue-lock"
+    ManagedBy = "Terraform"
+  }
+}
+
+resource "aws_iam_role_policy" "flink_iceberg_lock_access" {
+  name = "flink-iceberg-lock-policy"
+  role = var.flink_execution_role_id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:DescribeTable",
+          "dynamodb:CreateTable",
+        ]
+        Resource = aws_dynamodb_table.iceberg_glue_lock.arn
       }
     ]
   })

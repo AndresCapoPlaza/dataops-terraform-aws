@@ -1,3 +1,15 @@
+> **Nota sobre la estructura del repositorio (a partir de la Entrega 5)**
+>
+> El repositorio se reorganizó en dos carpetas de primer nivel:
+>
+> - **`infra/`** — toda la infraestructura como código: `bootstrap/`, `environments/dev/`
+>   (con `main.tf` y los módulos Terraform) y `k8s/`.
+> - **`app/`** — todo el código de aplicación: `flink/`, `producers/` y `spark/`.
+>
+> Las rutas mencionadas en las Entregas 1 a 4 deben leerse con ese prefijo:
+> `bootstrap/` es ahora `infra/bootstrap/`, `environments/dev/` es
+> `infra/environments/dev/`, `flink/` es `app/flink/`, y así sucesivamente.
+
 # DataOps - Entrega 1
 ## DataOps con Terraform & AWS
 
@@ -891,99 +903,275 @@ mi-proyecto-dataops/
 
 ---
 
+---
+
 # DataOps - Entrega 5
 
 ## 1. Descripción del proyecto
 
-En esta quinta entrega se implementó la capa de almacenamiento y catálogo
-(Lakehouse), transformando la salida del pipeline de Flink en una tabla
-transaccional de Apache Iceberg, registrada y gobernada por AWS Glue Data
-Catalog.
+En esta quinta entrega se implementó la **capa de almacenamiento y catálogo (Lakehouse)**:
+la salida del pipeline de Flink dejó de ser un archivo plano huérfano en S3 y pasó a ser una
+**tabla transaccional de Apache Iceberg**, registrada y gobernada en **AWS Glue Data Catalog**
+y consultable desde **Amazon Athena**.
 
 ## 2. Arquitectura
 
 ```mermaid
 flowchart LR
-    P[Productor Python<br/>producer_kinesis.py] --> K[Kinesis Data Stream<br/>clicks-ecommerce]
-    K --> F[Flink<br/>Table API + SQL]
-    F -->|Tumbling Window 1 min<br/>conteo por product_id| I[(Tabla Iceberg<br/>clicks_by_product)]
-    I -.->|Metadata + Schema| G[AWS Glue<br/>Data Catalog]
-    I -->|Archivos .parquet| S3[(S3 - Lakehouse)]
+    P[Productor Python<br/>producer_kinesis_stream.py] --> K[Kinesis Data Stream<br/>clicks-ecommerce · 2 shards]
+    K --> F[Apache Flink 1.15<br/>Table API + SQL]
+    F -->|TUMBLE 1 min<br/>COUNT por product_id<br/>checkpoint EXACTLY_ONCE 30s| I[(Tabla Iceberg<br/>clicks_by_product)]
+    I -.->|metadata + schema| G[AWS Glue<br/>Data Catalog · lakehouse_db]
+    I -->|data/product_id=N/*.parquet| S3[(S3 · Lakehouse)]
+    G --> A[Amazon Athena]
 ```
 
-## 3. Infraestructura como código (Terraform)
+## 3. Estructura del proyecto
 
-Nuevo módulo: `environments/dev/modules/glue/`
+```text
+mi-proyecto-dataops/
+│
+├── infra/                                  Infraestructura como código
+│   ├── bootstrap/                          Backend remoto de Terraform (S3 + DynamoDB)
+│   ├── environments/
+│   │   └── dev/
+│   │       ├── main.tf                     Composición del entorno
+│   │       ├── provider.tf
+│   │       ├── variables.tf
+│   │       ├── outputs.tf
+│   │       └── modules/
+│   │           ├── network/
+│   │           ├── identity/
+│   │           ├── kinesis/
+│   │           ├── flink/
+│   │           └── glue/                   ← Entrega 5: catálogo, IAM y lock
+│   └── k8s/                                Manifiestos de la Entrega 3
+│
+├── app/                                    Código de aplicación
+│   ├── flink/
+│   │   ├── iceberg_processor.py            ← Entrega 5: Kinesis → Iceberg → Glue
+│   │   ├── clicks_processor.py             Entrega 4
+│   │   ├── lib/                            JAR del conector Kinesis (no versionado)
+│   │   └── lib_iceberg/                    JAR de Iceberg + Hadoop (no versionado)
+│   ├── producers/
+│   │   ├── producer_kinesis_stream.py      ← Entrega 5: emisión continua
+│   │   ├── producer_kinesis.py             Entrega 2
+│   │   └── producer_kafka.py               Entrega 3
+│   └── spark/
+│       └── spark_streaming.py              Entrega 3
+│
+├── scripts/
+│   └── verify_iceberg.ps1                  Verificación de los criterios de aceptación
+│
+├── docs/
+│   └── preentrega5_lakehouse.md            Documentación técnica ampliada
+│
+├── evidence/                               Capturas y salidas de consola
+├── .gitignore
+└── README.md
+```
 
-Recursos definidos:
+## 4. Infraestructura como código (Terraform)
 
-- `aws_glue_catalog_database` (`lakehouse_db`): contenedor lógico de las
-  tablas Iceberg.
-- Permisos IAM ampliados para el rol de ejecución de Flink:
-  `glue:GetDatabase`, `glue:GetTable`, `glue:CreateTable`, `glue:UpdateTable`,
-  `glue:DeleteTable`, `glue:GetPartitions`, `glue:BatchCreatePartition`.
-- Permisos de lectura/escritura extendidos en el bucket S3 designado para
-  el Lakehouse (prefijo `lakehouse/`).
+Módulo nuevo: `infra/environments/dev/modules/glue/`
 
-## 4. Estrategia de particionado
+| Recurso | Rol |
+|---|---|
+| `aws_glue_catalog_database.lakehouse_db` | Metastore central de las tablas Iceberg |
+| `aws_iam_role_policy.flink_glue_access` | `glue:GetDatabase`, `GetTable`, `CreateTable`, `UpdateTable`, `DeleteTable`, `GetPartitions`, `BatchCreatePartition` |
+| `aws_iam_role_policy.flink_lakehouse_s3_access` | `s3:GetObject`, `PutObject`, `DeleteObject`, `ListBucket` sobre el bucket del Lakehouse |
+| `aws_dynamodb_table.iceberg_glue_lock` | Lock manager explícito para commits concurrentes |
+| `aws_iam_role_policy.flink_iceberg_lock_access` | Acceso del rol de Flink a la tabla de lock |
+| `aws_s3_bucket_versioning.raw_bucket_versioning` | Versionado del bucket (recomendado para Iceberg) |
+
+El `account_id` de las políticas se resuelve con `data.aws_caller_identity.current`,
+sin valores hardcodeados.
+
+Despliegue:
+
+```powershell
+cd infra\environments\dev
+terraform init
+terraform validate
+terraform plan
+terraform apply
+```
+
+## 5. Estrategia de particionado y *partition pruning*
 
 La tabla `clicks_by_product` está **particionada por `product_id`**.
 
-Se eligió esta estrategia porque las consultas más frecuentes sobre esta
-tabla van a filtrar o agrupar por producto (por ejemplo: "¿cuántos clics
-tuvo el producto X en la última hora?"). Con el particionado por
-`product_id`, Iceberg puede aplicar **partition pruning**: al ejecutar una
-consulta con un filtro `WHERE product_id = 'product-5'`, el motor descarta
-directamente todos los archivos de datos de las demás particiones sin
-necesidad de leerlos, reduciendo drásticamente el volumen de I/O y el
-tiempo de respuesta. Esto es especialmente valioso a medida que la tabla
-crece con más ventanas de tiempo acumuladas.
+La tabla es una agregación por ventana (`product_id`, `window_end`, `click_count`) y el patrón
+de consulta dominante es *"¿cómo evolucionan los clics de este producto?"*, es decir, el filtro
+casi siempre incluye `product_id`.
 
-## 5. Implementación en Flink
+Iceberg guarda en los manifiestos el valor de partición y las estadísticas por columna
+(min/max, nulos) de cada archivo de datos. Al ejecutar:
 
-Archivo: `flink/iceberg_processor.py`
+```sql
+SELECT SUM(click_count) FROM lakehouse_db.clicks_by_product WHERE product_id = 'product-3';
+```
 
-- Se define una tabla fuente sobre el stream `clicks-ecommerce` usando el
-  conector `kinesis` en modo `raw`, extrayendo los campos del JSON con
-  `JSON_VALUE` directamente en SQL.
-- Se define el catálogo Iceberg respaldado por Glue:
-  `'catalog-impl' = 'org.apache.iceberg.aws.glue.GlueCatalog'`.
-- Se crea la tabla Iceberg `clicks_by_product` particionada por
-  `product_id`.
-- Se ejecuta un `INSERT INTO` continuo que agrega los clics por producto
-  en ventanas Tumbling de 1 minuto.
-- **Checkpointing habilitado** (`env.enable_checkpointing(30000)`): el
-  Iceberg Sink solo confirma (hace commit) los archivos de datos cuando
-  Flink completa un checkpoint. Sin esto, los datos quedarían escritos en
-  S3 pero la tabla nunca reflejaría los cambios en el catálogo.
+el planner resuelve el filtro **contra los metadatos**, descarta las particiones que no aplican
+y abre únicamente los Parquet de `data/product_id=product-3/`. Eso es *partition pruning*:
+reduce el `DataScannedInBytes` — que es exactamente lo que Athena factura — sin recorrer el
+resto de la tabla.
 
-## 6. Prueba de persistencia
+Criterios que sostienen la elección:
 
-Se ejecutó el job localmente contra el stream real de Kinesis y el
-catálogo de Glue real en AWS, confirmando:
+- **Cardinalidad controlada.** ~10 productos en el escenario de prueba: suficiente selectividad
+  para podar, sin caer en el *small files problem* que produciría particionar por algo de
+  cardinalidad alta (`user_id`, `event_id`).
+- **`window_end` no se particiona.** Iceberg ya guarda min/max de esa columna por archivo, así
+  que un filtro temporal se resuelve por *file pruning* con estadísticas. Si el volumen creciera,
+  la evolución natural sería `PARTITIONED BY (product_id, days(window_end))` — y una ventaja
+  clave de Iceberg es que ese cambio se hace con **partition evolution**, sin reescribir el
+  histórico ni romper las consultas existentes (a diferencia de Hive).
+- **Alineado con el paralelismo de escritura.** Con `product_id` como clave de agrupación, cada
+  writer escribe en un set acotado de particiones por checkpoint, manteniendo bajo el número de
+  archivos por commit.
 
-- Generación de archivos `.parquet` particionados por `product_id` en S3.
-- Archivos de metadata (`*.metadata.json`) y snapshots (`snap-*.avro`)
-  actualizándose en cada checkpoint.
-- La tabla visible y consultable desde la consola de AWS Glue, con el
-  schema correcto (`product_id: string`, `window_end: timestamp`,
-  `click_count: bigint`).
+## 6. Implementación en Flink
 
-## 7. Evidencia
+Archivo: `app/flink/iceberg_processor.py`
 
-La siguiente captura muestra la tabla `clicks_by_product` en la consola
-de AWS Glue, con formato Apache Iceberg, base de datos `lakehouse_db`,
-ubicación en S3 y el schema completo:
+- Tabla fuente sobre `clicks-ecommerce` con el conector `kinesis` en formato `raw`, extrayendo
+  los campos con `JSON_VALUE` en SQL y declarando `WATERMARK` sobre el event time.
+- Catálogo Iceberg respaldado por Glue:
+  `'catalog-impl' = 'org.apache.iceberg.aws.glue.GlueCatalog'` con `S3FileIO`.
+- Tabla `clicks_by_product` en `format-version 2`, Parquet + zstd, particionada por `product_id`.
+- `INSERT INTO` continuo con `TUMBLE` de 1 minuto agrupando por producto.
+- **Checkpointing explícito**: `EXACTLY_ONCE` cada 30 s, `min_pause` 5 s, timeout 180 s y
+  `tolerable_checkpoint_failure_number(0)`. El Iceberg Sink **sólo commitea los manifiestos
+  cuando Flink completa un checkpoint**: sin esto, los Parquet quedan en S3 pero la tabla del
+  catálogo aparece vacía.
+
+## 7. Ejecución de la prueba de persistencia
+
+```powershell
+python -u app\flink\iceberg_processor.py
+```
+
+El script envía el job, **lanza el productor continuo automáticamente**, monitorea el estado de
+los checkpoints vía la REST API del cluster local y se auto-cancela de forma limpia al terminar.
+
+El productor emite de forma **sostenida**, no en ráfagas: con event time, una ventana `TUMBLE`
+sólo cierra cuando llega un evento posterior al fin de la ventana. Un productor que envía 100
+eventos y termina congela el watermark y la última ventana nunca dispara.
+
+Verificación de los criterios de aceptación:
+
+```powershell
+.\scripts\verify_iceberg.ps1
+```
+
+## 8. Resultado verificado
+
+Corrida del 2026-09-08, 23:31–23:38 (7 minutos, ~5 eventos/s):
+
+| Criterio de aceptación | Resultado |
+|---|---|
+| Infraestructura declarativa | Catálogo, roles, versionado y lock definidos en Terraform |
+| Formato Iceberg | `metadata_location` avanzó de `00000-*` a `00005-*`: **5 commits**, con 5 `snap-*.avro` y 5 manifiestos `*-m0.avro` |
+| Consistencia | Athena devuelve las ventanas de un minuto con ~17 clics por producto, reflejando la agregación de Flink |
+| Cero errores de concurrencia | 5 commits secuenciales sin `ConcurrentModificationException`; `metadata.json` creciendo de 2,7 KB a 7,8 KB |
+| Partition pruning | Filtro por `product_id`: **230 bytes escaneados** frente al escaneo del total de particiones |
+
+Se generaron **50 archivos Parquet** distribuidos en las 10 particiones `product_id=product-N/`.
+
+### Concurrencia
+
+`GlueCatalog` implementa *optimistic concurrency control* nativo: cada commit hace un
+`UpdateTable` condicionado al `VersionId` actual de la tabla; si otro writer commiteó en el
+medio, el commit se reintenta sobre el nuevo snapshot en vez de sobrescribirlo. Sobre esa base
+se añadió `aws_dynamodb_table.iceberg_glue_lock` como lock manager explícito para escenarios
+multi-writer, que se activa con:
+
+```powershell
+$env:USE_DYNAMO_LOCK = "1"
+python -u app\flink\iceberg_processor.py
+```
+
+## 9. Compatibilidad de dependencias
+
+| Componente | Versión |
+|---|---|
+| Flink / PyFlink | 1.15.4 |
+| `flink-sql-connector-kinesis` | 1.15.4 |
+| `iceberg-flink-runtime-1.15` | 1.4.2 |
+| `iceberg-aws-bundle` | 1.4.2 |
+| `hadoop-client-api` / `-runtime` | 3.3.4 |
+
+### `LinkageError` de Dropwizard Metrics — el bloqueante real
+
+Durante la puesta en marcha, el job escribía correctamente los Parquet en S3 pero **la tabla
+del catálogo quedaba siempre vacía**. El síntoma era engañoso: `data/` se llenaba de Parquet
+válidos, `metadata/` sólo tenía el JSON de creación, y Athena devolvía la tabla con el schema
+correcto y cero filas.
+
+La causa raíz apareció al capturar la excepción con `TableResult.wait()` en un hilo de
+vigilancia — los logs del MiniCluster no la mostraban:
+
+```
+java.lang.LinkageError: loader constraint violation:
+loader 'app' wants to load class com.codahale.metrics.Histogram.
+A different class with the same name was previously loaded by ChildFirstClassLoader
+  at org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper.update
+  at org.apache.iceberg.flink.sink.IcebergStreamWriterMetrics.updateFlushResult
+  at org.apache.iceberg.flink.sink.IcebergStreamWriter.flush
+  at IcebergStreamWriter.prepareSnapshotPreBarrier
+```
+
+`iceberg-flink-runtime` trae **bundleado** `com.codahale.metrics`, y PyFlink ya expone
+`flink-metrics-dropwizard` en su classpath de sistema. La misma clase queda cargada por dos
+classloaders distintos y la JVM rechaza la operación cuando el writer de Iceberg registra las
+métricas del flush.
+
+El fallo ocurre en `prepareSnapshotPreBarrier`, es decir **sólo cuando hay datos reales que
+escribir** — por eso las corridas sin tráfico completaban checkpoints sin problema y el error
+parecía intermitente. Con la estrategia de reinicio por defecto, el job moría y revivía en
+bucle, dejando decenas de *orphan files*: Parquet válidos que ningún snapshot referencia.
+
+**Solución** — forzar resolución *parent-first* para esos paquetes, de modo que ambos
+componentes usen la misma clase:
+
+```python
+conf.set_string(
+    "classloader.parent-first-patterns.additional",
+    "com.codahale.metrics;org.apache.flink.dropwizard",
+)
+```
+
+Es un caso de libro del error común "mismatch de versiones de dependencias": no se manifiesta
+como un fallo de resolución en tiempo de build, sino como una `LinkageError` en runtime dentro
+del sink.
+
+### Lecciones operativas
+
+| Síntoma | Causa | Qué hacer |
+|---|---|---|
+| Parquet en `data/` pero `metadata/` sin `.avro` | El checkpoint dispara la fase de snapshot (que cierra y sube los archivos) pero nunca completa → el committer no commitea | Capturar la excepción con `TableResult.wait()`; los logs del MiniCluster no la muestran |
+| El job "se cuelga" sin errores | `restart-strategy` por defecto reinicia en silencio | `restart-strategy: none` durante el diagnóstico |
+| La última ventana nunca aparece | Con event time, `TUMBLE` cierra sólo al llegar un evento posterior al fin de ventana | Productor con emisión continua, no ráfagas |
+| No se ve la salida en consola | Python pasa a *block buffering* al redirigir por pipe | `python -u` |
+| Athena devuelve 0 filas con archivos presentes | Se borró `data/` dejando vivo el metadata: el snapshot apunta a archivos inexistentes | Borrar la tabla completa (Glue + prefijo S3), nunca sólo `data/` |
+
+> En Windows, el warning `Did not find winutils.exe` es esperado y no bloquea: Iceberg escribe
+> vía `S3FileIO` (SDK de AWS), no vía Hadoop FileSystem.
+
+## 10. Evidencia
 
 ![Tabla Iceberg en AWS Glue](evidence/glue-iceberg-table.png)
 
-## 8. Tecnologías utilizadas
+## 11. Tecnologías utilizadas
 
-- Apache Iceberg
+- Apache Iceberg 1.4.2
 - AWS Glue Data Catalog
+- Amazon Athena
 - Amazon S3 (Lakehouse)
-- Apache Flink (Table API + SQL)
+- Apache Flink 1.15 (PyFlink · Table API + SQL)
 - Amazon Kinesis Data Streams
+- Amazon DynamoDB (lock manager)
 - Terraform
 - Python + boto3
 - Git / GitHub
