@@ -69,3 +69,20 @@ module "glue" {
   lakehouse_bucket_arn    = aws_s3_bucket.raw_bucket.arn
   region                  = "us-east-1"
 }
+
+# ==============================================================================
+# ENTREGA 6 - Capa de analitica de baja latencia (Redshift Serverless)
+# ==============================================================================
+
+module "redshift" {
+  source = "./modules/redshift"
+
+  environment          = var.environment
+  region               = "us-east-1"
+  vpc_id               = module.network.vpc_id
+  vpc_cidr             = var.vpc_cidr
+  subnet_ids           = module.network.private_subnet_ids
+  kinesis_stream_arn   = module.kinesis.stream_arn
+  glue_database_name   = module.glue.database_name
+  lakehouse_bucket_arn = aws_s3_bucket.raw_bucket.arn
+}

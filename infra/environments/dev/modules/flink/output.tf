@@ -1,11 +1,11 @@
 output "flink_application_name" {
   description = "Nombre de la aplicación de Flink"
-  value       = aws_kinesisanalyticsv2_application.clicks_processor.name
+  value       = try(aws_kinesisanalyticsv2_application.clicks_processor[0].name, null)
 }
 
 output "flink_application_arn" {
   description = "ARN de la aplicación de Flink"
-  value       = aws_kinesisanalyticsv2_application.clicks_processor.arn
+  value       = try(aws_kinesisanalyticsv2_application.clicks_processor[0].arn, null)
 }
 
 output "flink_execution_role_arn" {

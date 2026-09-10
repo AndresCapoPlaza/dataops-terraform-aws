@@ -45,3 +45,17 @@ variable "region" {
   type        = string
   default     = "us-east-1"
 }
+
+variable "enable_managed_flink" {
+  type        = bool
+  description = <<-EOT
+    Despliega la aplicacion de Amazon Managed Service for Apache Flink.
+    Desactivada por defecto: este recurso factura por KPU-hora de forma
+    continua mientras existe (~USD 0,11/KPU-hora), y requiere que el artefacto
+    clicks_processor.zip este previamente subido a S3. La logica de
+    procesamiento se valida ejecutando el job localmente con PyFlink contra
+    el stream real de Kinesis.
+  EOT
+  default     = false
+}
+

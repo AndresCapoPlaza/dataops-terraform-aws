@@ -4,7 +4,7 @@
 >
 > - **`infra/`** — toda la infraestructura como código: `bootstrap/`, `environments/dev/`
 >   (con `main.tf` y los módulos Terraform) y `k8s/`.
-> - **`app/`** — todo el código de aplicación: `flink/`, `producers/` y `spark/`.
+> - **`app/`** — todo el código de aplicación: `flink/`, `producers/`, `spark/` y `redshift/`.
 >
 > Las rutas mencionadas en las Entregas 1 a 4 deben leerse con ese prefijo:
 > `bootstrap/` es ahora `infra/bootstrap/`, `environments/dev/` es
@@ -1175,3 +1175,188 @@ del sink.
 - Terraform
 - Python + boto3
 - Git / GitHub
+
+---
+
+# DataOps - Entrega 6
+
+## 1. Descripción del proyecto
+
+En esta sexta entrega se incorporó la **capa de consulta analítica de baja latencia**
+mediante Amazon Redshift Serverless. Hasta el módulo 5, el recorrido del dato terminaba
+en el Lakehouse: Flink consolidaba los clics en ventanas de un minuto y los persistía
+como tabla Apache Iceberg gobernada por AWS Glue. Ese camino es sólido para el análisis
+histórico, pero introduce una latencia de minutos, porque un registro sólo es consultable
+después de que cierra su ventana y se completa el checkpoint que confirma el commit.
+
+**Redshift Streaming Ingestion** cubre la franja que ese diseño deja descubierta: conecta
+el Kinesis Data Stream directamente con el warehouse, sin escalar por S3 ni por un proceso
+de carga intermedio. La latencia medida en esta implementación es de **2 a 4 segundos**.
+
+## 2. Arquitectura
+
+```mermaid
+flowchart LR
+    P[Productor Python<br/>producer_kinesis_stream.py] --> K[Kinesis Data Stream<br/>clicks-ecommerce · 2 shards]
+
+    K -->|Streaming Ingestion<br/>sin S3 intermedio| MV[MATERIALIZED VIEW<br/>mv_clicks_stream_raw<br/>JSON_PARSE · SUPER]
+    K -->|consume| F[Apache Flink<br/>TUMBLE 1 min]
+
+    F --> I[(Apache Iceberg · S3<br/>clicks_by_product)]
+    I -.->|metadata| G[AWS Glue Data Catalog<br/>lakehouse_db]
+
+    MV -->|datos calientes<br/>2-4 s| R[Amazon Redshift Serverless<br/>lakehouse-wg-dev · 8 RPU]
+    G -->|datos históricos| R
+
+    R --> Q[v_clicks_hot_vs_cold<br/>consulta federada]
+```
+
+![Arquitectura Entrega 6](evidence/entrega6-arquitectura.png)
+
+## 3. Infraestructura como código (Terraform)
+
+Módulo nuevo: `infra/environments/dev/modules/redshift/`
+
+| Recurso | Rol |
+|---|---|
+| `aws_redshiftserverless_namespace` | Capa lógica. La contraseña del usuario admin la genera y rota Secrets Manager (`manage_admin_password`), sin secretos en el código ni en el state |
+| `aws_redshiftserverless_workgroup` | Capa de cómputo: 8 RPU, tres subredes privadas, sin acceso público |
+| `aws_iam_role.redshift_role` | Rol de servicio que Redshift asume en las sentencias `CREATE EXTERNAL SCHEMA` |
+| `aws_iam_role_policy.redshift_kinesis_read` | `kinesis:DescribeStream`, `GetShardIterator`, `GetRecords`, `ListShards` + `kms:Decrypt` acotado por `ViaService` |
+| `aws_iam_role_policy.redshift_glue_lakehouse` | Lectura del Glue Data Catalog y de los Parquet del Lakehouse en S3 |
+| `aws_security_group.redshift_sg` | Puerto 5439 restringido al CIDR de la VPC |
+
+Se eligió **Redshift Serverless** sobre un clúster provisionado por una razón económica
+concreta: Serverless factura por RPU-segundo de cómputo efectivamente consumido, mientras
+que un clúster provisionado factura mientras existe, aunque nadie lo consulte.
+
+```powershell
+cd infra\environments\dev
+terraform init
+terraform plan
+terraform apply
+```
+
+> **Requisito no evidente:** Redshift Serverless exige subredes en **al menos tres Zonas de
+> Disponibilidad distintas**. La VPC del proyecto tenía dos, así que el módulo `network` se
+> amplió a tres antes de poder desplegar.
+
+## 4. Implementación SQL
+
+Script completo y comentado: **`app/redshift/checkpoint6_redshift.sql`**, organizado en 7 bloques.
+
+Convenciones de nombrado: `ext_` para esquemas externos, `mv_` para vistas materializadas,
+`v_` para vistas lógicas.
+
+### 4.1 Ingesta directa desde Kinesis
+
+```sql
+CREATE EXTERNAL SCHEMA IF NOT EXISTS ext_kinesis
+FROM KINESIS
+IAM_ROLE 'arn:aws:iam::<ACCOUNT_ID>:role/redshift-serverless-dev';
+```
+
+La vista materializada de aterrizaje **no castea nada**: guarda el payload como texto y como
+`SUPER`, y marca cada registro con `CAN_JSON_PARSE`. Es la protección frente al *schema drift*
+que señala el enunciado: si el productor cambia la estructura del JSON, el registro entra igual,
+queda marcado como inválido y es visible en una vista de cuarentena. La ingesta nunca se rompe
+y el dato problemático no se pierde.
+
+### 4.2 Modelado a tipos nativos
+
+Cinco campos extraídos con `JSON_EXTRACT_PATH_TEXT` y casteados a tipos nativos, más una
+columna calculada `latencia_ingesta_seg` que mide la diferencia entre el *event time* del JSON
+y el *processing time* de Kinesis.
+
+### 4.3 Integración Lakehouse y consulta federada
+
+```sql
+CREATE EXTERNAL SCHEMA IF NOT EXISTS ext_lakehouse
+FROM DATA CATALOG
+DATABASE 'lakehouse_db'
+IAM_ROLE 'arn:aws:iam::<ACCOUNT_ID>:role/redshift-serverless-dev'
+REGION 'us-east-1';
+```
+
+La vista `v_clicks_hot_vs_cold` combina, por producto, los clics en vivo del stream con el
+consolidado histórico de la tabla Iceberg. Requiere `WITH NO SCHEMA BINDING`: Redshift valida
+las dependencias de una vista al crearla, pero los metadatos de un esquema externo viven en
+Glue y evolucionan de forma independiente.
+
+### 4.4 Seguridad
+
+Rol `analytics_reader` con privilegios estrictamente de lectura y usuario `analyst_user` con
+`PASSWORD DISABLE`, que fuerza autenticación federada por IAM. El esquema `ext_kinesis` queda
+**fuera** del rol: un analista consulta datos modelados y validados, no la fuente cruda del stream.
+
+## 5. Estrategia de refresco
+
+El refresco de una MV sobre Streaming Ingestion es **incremental**: Redshift lee sólo los
+registros posteriores al último `sequence_number` procesado en cada shard.
+
+| Intervalo | Latencia | Consumo de RPU | Cuándo conviene |
+|---|---|---|---|
+| 1 segundo | Casi nula | Muy alto y constante | Fraude, trading, alarmas críticas |
+| **30-60 segundos** | Aceptable | Acotado y predecible | **Este caso de uso** |
+| 5 minutos o más | Alta | Mínimo | Reportes que ya cubre el Lakehouse |
+
+Se adoptó un intervalo del orden de **60 segundos**: ninguna decisión comercial sobre un
+ranking de productos se toma con granularidad menor, de modo que refrescar más seguido sólo
+agregaría costo.
+
+## 6. Resultado verificado
+
+Corrida del 2026-09-09, 1.736 eventos emitidos a 5 ev/s:
+
+| Criterio de evaluación | Resultado |
+|---|---|
+| **Funcionalidad** — datos sin errores de casting | 1.736 eventos ingeridos, 1.736 con JSON válido, cero en cuarentena |
+| **Integración** — Iceberg y stream en la misma sesión | `v_clicks_hot_vs_cold` devuelve clics del stream junto a las 5 ventanas históricas de Iceberg |
+| **Seguridad** — autenticación IAM entre servicios | Rol de servicio acotado por recurso + `analytics_reader` de solo lectura + `PASSWORD DISABLE` |
+| **Claridad** — SQL comentado y buen nombrado | Script en 7 bloques con prefijos consistentes |
+
+**Latencia de punta a punta: mínimo 2 s, promedio 2 s, máximo 4 s.**
+
+![Streaming Ingestion](evidence/entrega6-streaming-ingestion.png)
+
+![Consulta federada](evidence/entrega6-consulta-federada.png)
+
+![Lag de ingesta](evidence/entrega6-lag-ingesta.png)
+
+## 7. Monitoreo del lag
+
+```sql
+-- Estado del scan por shard: posicion y volumen leido del stream
+SELECT * FROM sys_stream_scan_states ORDER BY record_time DESC LIMIT 10;
+
+-- Lag de punta a punta medido sobre los propios datos
+SELECT
+    COUNT(*)                            AS eventos_ingeridos,
+    MIN(latencia_ingesta_seg)           AS lag_min_seg,
+    ROUND(AVG(latencia_ingesta_seg), 2) AS lag_promedio_seg,
+    MAX(latencia_ingesta_seg)           AS lag_max_seg
+FROM public.v_clicks_tipado;
+```
+
+## 8. Aprendizajes operativos
+
+| Síntoma | Causa | Solución |
+|---|---|---|
+| `syntax error at or near "raw"` | `raw` es palabra reservada en Redshift; el error apunta al nombre de la función, no al alias | Renombrar el alias de tabla |
+| `date_diff(unknown, timestamp with time zone, timestamp without time zone) does not exist` | `approximate_arrival_timestamp` es `TIMESTAMP` sin zona | Unificar ambos valores en `TIMESTAMP` (los dos están en UTC) |
+| `External tables are not supported in views` | Redshift valida dependencias al crear la vista | Agregar `WITH NO SCHEMA BINDING` |
+| Ingesta falla leyendo un stream cifrado | Falta `kms:Decrypt` | Añadirlo con condición `ViaService` |
+| `apply` de Redshift Serverless falla | Menos de 3 subredes / 3 AZ | Ampliar el módulo `network` |
+
+## 9. Documento de entrega
+
+**`docs/CheckPoint_Redshift_Capo_Andres.pdf`** — 15 páginas: diagrama de arquitectura, SQL
+comentado por bloques, 11 figuras de evidencia y la justificación de cada decisión de diseño.
+
+## 10. Tecnologías utilizadas
+
+- Amazon Redshift Serverless (Streaming Ingestion + Spectrum)
+- Amazon Kinesis Data Streams
+- Apache Iceberg · AWS Glue Data Catalog
+- Amazon S3 (Lakehouse) · AWS Secrets Manager · AWS KMS
+- Terraform · Python + boto3 · Git / GitHub

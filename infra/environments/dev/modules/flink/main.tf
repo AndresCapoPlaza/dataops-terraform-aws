@@ -139,6 +139,9 @@ resource "aws_cloudwatch_log_stream" "flink_log_stream" {
 # ============================================================
 
 resource "aws_kinesisanalyticsv2_application" "clicks_processor" {
+  # Controlado por var.enable_managed_flink (ver variables.tf)
+  count = var.enable_managed_flink ? 1 : 0
+
   name                   = "${var.app_name}-${var.environment}"
   runtime_environment    = "FLINK-1_15"
   service_execution_role = aws_iam_role.flink_execution_role.arn
