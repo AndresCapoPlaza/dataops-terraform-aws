@@ -14,6 +14,12 @@
 
 data "aws_caller_identity" "current" {}
 
+# Clave gestionada por AWS con la que esta cifrado el Kinesis Data Stream.
+# Resolverla permite acotar kms:Decrypt a su ARN en lugar de usar "*".
+data "aws_kms_alias" "kinesis" {
+  name = "alias/aws/kinesis"
+}
+
 # ------------------------------------------------------------------------------
 # 1. ROL IAM DE SERVICIO PARA REDSHIFT
 # ------------------------------------------------------------------------------
@@ -65,18 +71,12 @@ resource "aws_iam_role_policy" "redshift_kinesis_read" {
         Resource = var.kinesis_stream_arn
       },
       {
-        Sid      = "ListStreams"
-        Effect   = "Allow"
-        Action   = ["kinesis:ListStreams"]
-        Resource = "*"
-      },
-      {
         # El stream está cifrado con KMS: sin esta acción, GetRecords devuelve
         # registros que Redshift no puede descifrar.
         Sid      = "DecryptKinesisRecords"
         Effect   = "Allow"
         Action   = ["kms:Decrypt"]
-        Resource = "*"
+        Resource = data.aws_kms_alias.kinesis.target_key_arn
         Condition = {
           StringEquals = {
             "kms:ViaService" = "kinesis.${var.region}.amazonaws.com"

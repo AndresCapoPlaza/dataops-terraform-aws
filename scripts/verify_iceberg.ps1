@@ -4,7 +4,12 @@
 # ============================================================
 
 $ErrorActionPreference = "Stop"
-$BUCKET = "datalake-raw-dev-123456789012"
+# El bucket se resuelve desde el output de Terraform: no queda ningun
+# identificador de cuenta fijo en el script.
+$BUCKET = $env:LAKEHOUSE_BUCKET
+if (-not $BUCKET) {
+    $BUCKET = (terraform -chdir="..\terraform\environments\dev" output -raw raw_bucket_name)
+}
 $DB     = "lakehouse_db"
 $TABLE  = "clicks_by_product"
 $REGION = "us-east-1"

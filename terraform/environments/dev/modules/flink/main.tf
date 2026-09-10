@@ -102,14 +102,16 @@ resource "aws_iam_role_policy" "flink_cloudwatch_logs" {
     Statement = [
       {
         Effect = "Allow"
+        # Acotado al log group de esta aplicacion. Se eliminaron
+        # logs:CreateLogGroup y DescribeLogGroups: el grupo lo crea Terraform
+        # y describirlo no es necesario en runtime.
+        Sid    = "WriteApplicationLogs"
         Action = [
-          "logs:CreateLogGroup",
           "logs:CreateLogStream",
           "logs:PutLogEvents",
-          "logs:DescribeLogGroups",
           "logs:DescribeLogStreams",
         ]
-        Resource = "*"
+        Resource = "${aws_cloudwatch_log_group.flink_log_group.arn}:*"
       }
     ]
   })

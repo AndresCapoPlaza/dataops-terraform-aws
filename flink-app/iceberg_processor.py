@@ -26,7 +26,15 @@ from pyflink.datastream import StreamExecutionEnvironment, CheckpointingMode
 from pyflink.table import StreamTableEnvironment, EnvironmentSettings
 
 # ---------------------------------------------------------------- parametros
-BUCKET_NAME = "datalake-raw-dev-123456789012"
+# El bucket se resuelve desde el entorno para no fijar el account id en el
+# codigo. Terraform lo expone en el output `raw_bucket_name`:
+#     $env:LAKEHOUSE_BUCKET = terraform output -raw raw_bucket_name
+BUCKET_NAME = os.getenv("LAKEHOUSE_BUCKET")
+if not BUCKET_NAME:
+    raise SystemExit(
+        "Falta la variable de entorno LAKEHOUSE_BUCKET.\n"
+        "Obtenerla con:  terraform output -raw raw_bucket_name"
+    )
 REGION = "us-east-1"
 GLUE_DATABASE = "lakehouse_db"
 ICEBERG_TABLE = "clicks_by_product"
@@ -48,7 +56,12 @@ PRODUCER_RATE = os.getenv("PRODUCER_RATE", "5")
 USE_DYNAMO_LOCK = os.getenv("USE_DYNAMO_LOCK", "0") == "1"
 DYNAMO_LOCK_TABLE = "iceberg_glue_lock"
 
-BASE = "file:///C:/Users/Usuario/Desktop/Nueva%20carpeta/.data11/mi-proyecto-dataops/app/flink"
+# Ruta local de los conectores JAR. Configurable por entorno para que el job
+# se pueda ejecutar en cualquier maquina sin editar el codigo.
+BASE = os.getenv(
+    "FLINK_JARS_BASE",
+    "file:///" + os.path.dirname(os.path.abspath(__file__)).replace("\\", "/").replace(" ", "%20"),
+)
 JARS = [
     f"{BASE}/lib/flink-sql-connector-kinesis-1.15.4.jar",
     f"{BASE}/lib_iceberg/iceberg-flink-runtime-1.15-1.4.2.jar",

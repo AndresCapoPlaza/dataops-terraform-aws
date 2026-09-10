@@ -1,3 +1,11 @@
+# ==============================================================================
+# CONTEXTO DE LA CUENTA
+# El account id se resuelve en tiempo de ejecucion. Ningun identificador de
+# cuenta queda fijo en el codigo: el stack se despliega en cualquier cuenta
+# sin editar una sola linea.
+# ==============================================================================
+data "aws_caller_identity" "current" {}
+
 # 1. Invocación del Módulo de Red Base
 module "network" {
   source      = "./modules/network"
@@ -6,7 +14,7 @@ module "network" {
 }
 # 2. Bucket S3 para Data Lake (Capa RAW)
 resource "aws_s3_bucket" "raw_bucket" {
-  bucket        = "datalake-raw-${var.environment}-${var.account_id}"
+  bucket        = "datalake-raw-${var.environment}-${data.aws_caller_identity.current.account_id}"
   force_destroy = true
   tags = {
     Name        = "Data Lake Raw Bucket"

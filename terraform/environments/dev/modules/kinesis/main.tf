@@ -1,3 +1,24 @@
+# ------------------------------------------------------------------------------
+# 0. CONTEXTO DE LA CUENTA
+# Evita hardcodear account id y region en los ARN de las politicas.
+# ------------------------------------------------------------------------------
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+# ------------------------------------------------------------------------------
+# Log group de Firehose gestionado por Terraform.
+# Declararlo aqui permite acotar la politica IAM a su ARN en lugar de usar "*".
+# ------------------------------------------------------------------------------
+resource "aws_cloudwatch_log_group" "firehose" {
+  name              = "/aws/kinesis-firehose/${var.stream_name}"
+  retention_in_days = 7
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
 # BLOQUE A: KINESIS DATA STREAM
 # ------------------------------------------------------------------------------
 # 1. KINESIS DATA STREAM (KDS) — PROVISIONED, 2 shards
@@ -71,13 +92,15 @@ resource "aws_iam_role_policy" "firehose" {
         ]
       },
       {
+        # Acotado al log group de este delivery stream. Se elimino
+        # logs:CreateLogGroup porque el grupo lo crea Terraform.
+        Sid    = "WriteFirehoseLogs"
         Effect = "Allow"
         Action = [
           "logs:PutLogEvents",
-          "logs:CreateLogGroup",
           "logs:CreateLogStream"
         ]
-        Resource = "*"
+        Resource = "${aws_cloudwatch_log_group.firehose.arn}:*"
       }
     ]
   })
@@ -159,5 +182,36 @@ resource "aws_cloudwatch_metric_alarm" "write_throttle" {
   alarm_description   = "Escrituras excediendo la capacidad provisionada del stream"
   dimensions = {
     StreamName = aws_kinesis_stream.main.name
+  }
+}
+
+
+# ------------------------------------------------------------------------------
+# ALARMA: ITERATOR AGE
+# Mide cuanto se atrasa el consumidor respecto de la punta del shard. Es la
+# senal temprana de backpressure: si el consumidor (Flink o Redshift) no drena
+# al ritmo de escritura, esta metrica crece de forma sostenida hasta que los
+# registros expiran por retencion y se pierden datos.
+# Umbral: 60.000 ms (1 minuto) sobre la retencion de 24 h configurada.
+# ------------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "iterator_age" {
+  alarm_name          = "kinesis-iterator-age-${var.stream_name}"
+  alarm_description   = "El consumidor se esta atrasando respecto de la punta del shard (backpressure)"
+  namespace           = "AWS/Kinesis"
+  metric_name         = "GetRecords.IteratorAgeMilliseconds"
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 2
+  threshold           = 60000
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    StreamName = aws_kinesis_stream.main.name
+  }
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "Terraform"
   }
 }
