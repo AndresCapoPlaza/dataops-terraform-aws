@@ -1,14 +1,26 @@
-> **Nota sobre la estructura del repositorio (a partir de la Entrega 5)**
+> **Estructura del repositorio**
 >
-> El repositorio se reorganizó en dos carpetas de primer nivel:
+> La raíz sigue la estructura exigida por el Proyecto Final:
 >
-> - **`infra/`** — toda la infraestructura como código: `bootstrap/`, `environments/dev/`
->   (con `main.tf` y los módulos Terraform) y `k8s/`.
-> - **`app/`** — todo el código de aplicación: `flink/`, `producers/`, `spark/` y `redshift/`.
+> - **`terraform/`** — toda la infraestructura como código: `bootstrap/` (backend
+>   remoto) y `environments/dev/` con sus seis módulos.
+> - **`flink-app/`** — el código fuente de la aplicación de procesamiento.
+> - **`sql/`** — el DDL de la tabla Iceberg y los scripts de Redshift.
 >
-> Las rutas mencionadas en las Entregas 1 a 4 deben leerse con ese prefijo:
-> `bootstrap/` es ahora `infra/bootstrap/`, `environments/dev/` es
-> `infra/environments/dev/`, `flink/` es `app/flink/`, y así sucesivamente.
+> Alrededor de esas tres: `producers/` (generador de eventos sintéticos),
+> `scripts/` (empaquetado y verificación), `k8s/` y `spark/` (Entrega 3) y
+> `docs/` (el DAAT y las 23 evidencias).
+>
+> **Rutas históricas.** Las Entregas 1 a 6 se escribieron con la estructura
+> anterior y sus rutas hay que leerlas así:
+>
+> | En el texto de las entregas | Ruta actual |
+> |---|---|
+> | `bootstrap/`, `infra/bootstrap/` | `terraform/bootstrap/` |
+> | `environments/dev/`, `infra/environments/dev/` | `terraform/environments/dev/` |
+> | `flink/`, `app/flink/` | `flink-app/` |
+> | `app/producers/` | `producers/` |
+> | `app/redshift/checkpoint6_redshift.sql` | `sql/checkpoint6_redshift.sql` |
 
 # DataOps - Entrega 1
 ## DataOps con Terraform & AWS
@@ -1360,3 +1372,135 @@ comentado por bloques, 11 figuras de evidencia y la justificación de cada decis
 - Apache Iceberg · AWS Glue Data Catalog
 - Amazon S3 (Lakehouse) · AWS Secrets Manager · AWS KMS
 - Terraform · Python + boto3 · Git / GitHub
+
+---
+
+# Proyecto Final — Sistema de streaming end-to-end desplegado
+
+**Entregable:** `docs/Andres_Capo_Capstone_RealTime.pdf` — Documento de
+Arquitectura y Auditoría Técnica (DAAT), 39 páginas.
+
+## 1. Qué es este proyecto
+
+Un pipeline de datos en tiempo real sobre AWS, desplegado íntegramente con
+Terraform. Un evento de clic entra por Kinesis, lo procesa Apache Flink con
+ventanas de un minuto sobre *event time*, se materializa en una tabla Apache
+Iceberg registrada en el Glue Data Catalog, y queda disponible en Amazon
+Redshift Serverless por dos caminos independientes: *streaming ingestion*
+directa desde los shards para los datos calientes, y Redshift Spectrum sobre la
+misma tabla Iceberg para el histórico.
+
+```
+Productor --> Kinesis Data Stream --+--> PyFlink --> Iceberg (S3 + Glue) --> Athena
+              clicks-ecommerce      |                         |
+              2 shards, KMS         |                         +--> Redshift Spectrum
+                                    |                                     |
+                                    +--> Redshift Streaming Ingestion --> consulta
+                                    |         mv_clicks_stream_raw        federada
+                                    |
+                                    +--> Firehose --> S3 zona raw (respaldo)
+```
+
+## 2. Estructura exigida por el enunciado
+
+| Carpeta | Contenido |
+|---|---|
+| `terraform/` | Bootstrap del backend remoto y el entorno `dev` con seis módulos: `network`, `identity`, `kinesis`, `glue`, `flink`, `redshift`. |
+| `flink-app/` | `iceberg_processor.py` (job principal, Kinesis → ventana → Iceberg) y `clicks_processor.py` (artefacto de Managed Flink). |
+| `sql/` | `iceberg_clicks_by_product.sql` (DDL de Iceberg en Flink SQL) y `redshift_streaming_analytics.sql` (esquemas externos, MV, vistas, RBAC y monitoreo). |
+
+## 3. Cómo reproducirlo
+
+```powershell
+# 1. Backend remoto (una sola vez por cuenta)
+cd terraform/bootstrap
+terraform init && terraform apply
+
+# 2. Entorno completo: 45 recursos, sin pasos manuales
+cd ../environments/dev
+terraform init && terraform apply -auto-approve
+
+# 3. Unico acoplamiento entre infraestructura y aplicacion: un output
+$env:LAKEHOUSE_BUCKET = terraform output -raw raw_bucket_name
+
+# 4. Ejecutar el pipeline (lanza el productor por su cuenta)
+cd ../../..
+python -u flink-app/iceberg_processor.py
+#    Flink Dashboard -> http://localhost:8081
+#    NO cortar con Ctrl+C: el job se cancela solo al terminar
+
+# 5. Verificar que Iceberg commiteo (metadata debe avanzar de 00000)
+./scripts/verify_iceberg.ps1
+
+# 6. Redshift: ejecutar sql/redshift_streaming_analytics.sql en Query Editor v2,
+#    siguiendo el orden numerado del encabezado (pasos 1 a 20)
+
+# 7. IMPRESCINDIBLE: liberar los recursos que facturan por hora
+cd terraform/environments/dev
+terraform destroy -auto-approve
+```
+
+**Prerrequisitos:** Terraform ≥ 1.5, Python 3.11, Java 11,
+`pip install apache-flink==1.18.1 boto3`, y los JAR de los conectores en
+`flink-app/lib/` y `flink-app/lib_iceberg/` (excluidos del control de versiones
+por tamaño; las URL de Maven Central están en la sección de la Entrega 5).
+
+> ⚠️ El paso 3 no es opcional: el job aborta con un mensaje explícito si
+> `LAKEHOUSE_BUCKET` no está definida, en lugar de escribir en un bucket
+> equivocado. No hay ningún identificador de cuenta escrito a mano en el
+> repositorio.
+
+## 4. Parámetros críticos
+
+| Parámetro | Valor | Por qué |
+|---|---|---|
+| Checkpoint interval | 30 s | Gobierna la latencia de publicación en Iceberg: el `IcebergFilesCommitter` solo commitea al completar un checkpoint. También acota el trabajo a reprocesar tras un fallo. |
+| Parallelism | 1 | Un único escritor evita la contención de commits sobre el `VersionId` de Glue y hace innecesario el lock manager de DynamoDB. |
+| Shard count | 2 | Paralelismo real de lectura con holgura sobre la carga. Los 2 MB/s de cuota de lectura se reparten entre todos los consumidores. |
+| Watermark | event_time − 10 s | Triplica con holgura la latencia real medida (2–3 s). |
+| Ventana | TUMBLE 1 min | Granularidad del negocio. |
+| Retención Kinesis | 24 h | El mínimo del servicio; el histórico vive en Iceberg. |
+
+## 5. Resultados medidos
+
+Todas las cifras provienen de una corrida registrada el 10/09/2026 entre las
+23:21 y las 23:47 UTC. Las capturas están en `docs/evidencias/`.
+
+| Indicador | Valor |
+|---|---|
+| Recursos desplegados por Terraform | 45 en el apply inicial; 0 add / 0 change en el siguiente |
+| Checkpoints de Flink | 14 disparados · 14 completados · **0 fallidos** |
+| Excepciones en el Flink Dashboard | ninguna |
+| Commits en el catálogo de Glue | metadata `00000` → `00005`, 5 snapshots |
+| Latencia de ingesta a Redshift | mín. 2 s · prom. 2 s · máx. 3 s |
+| Eventos consultables en Redshift | 1.078 → 1.809 tras refresco incremental |
+| Registros descartados | 0 (`skipped_rows = 0` en ambos shards) |
+| Alarmas de CloudWatch | 3 desplegadas, 3 en estado OK |
+
+## 6. Hallazgos documentados
+
+El DAAT incluye una sección de auditoría con las limitaciones conocidas, porque
+un informe que solo muestra lo que funcionó no es una auditoría:
+
+- **Managed Flink no alcanza `RUNNING`.** La aplicación se despliega
+  correctamente con Terraform pero no arranca: el conector de Kinesis no está
+  en el classpath y la propiedad `jarfile` no lo resuelve. Tres intentos
+  documentados en el §15.1 del DAAT. No afecta al pipeline evidenciado, que
+  corre con `flink-app/iceberg_processor.py`.
+- **Throttling de lectura en Kinesis.** Durante la prueba se registró un pico
+  de `ReadProvisionedThroughputExceeded`: tres consumidores compartiendo los
+  2 MB/s por shard. Absorbido sin degradación medible (§15.2).
+- **Conflicto de classloaders (resuelto).** Flink escribía Parquet pero nunca
+  actualizaba el catálogo de Glue, sin un solo mensaje de error. Causa:
+  `com.codahale.metrics` cargado por dos classloaders. Se corrigió con
+  `classloader.parent-first-patterns.additional` (§15.3).
+
+## 7. Control de costos
+
+Kinesis factura por shard-hora y Managed Flink por KPU-hora **mientras los
+recursos existan**, se usen o no. El procedimiento de trabajo termina siempre
+con `terraform destroy` sobre `terraform/environments/dev` — nunca sobre
+`terraform/bootstrap`, donde vive el estado remoto.
+
+El módulo de Flink incluye el interruptor `enable_managed_flink` para
+desactivar el componente más caro sin borrar su código.

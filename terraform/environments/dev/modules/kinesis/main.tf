@@ -32,11 +32,50 @@ resource "aws_kinesis_stream" "main" {
   encryption_type = "KMS"
   kms_key_id      = "alias/aws/kinesis"
 
+  # --------------------------------------------------------------------------
+  # METRICAS A NIVEL DE FRAGMENTO (enhanced monitoring)
+  #
+  # Por defecto Kinesis solo publica metricas agregadas del stream. Con eso, un
+  # shard atrasado queda enmascarado por el promedio de los demas: el tablero
+  # se ve sano mientras una particion concreta se hunde.
+  #
+  # Habilitarlas expone IteratorAgeMilliseconds con dimension ShardId, que es
+  # lo que consumen las alarmas por fragmento definidas mas abajo.
+  #
+  # COSTO: se factura por metrica y por shard-hora. Con 2 shards y 5 metricas
+  # el importe es marginal, pero escala de forma lineal con el numero de
+  # fragmentos: en un stream de 200 shards conviene revisarlo.
+  # --------------------------------------------------------------------------
+  shard_level_metrics = var.enable_shard_level_metrics ? [
+    "IncomingBytes",
+    "IncomingRecords",
+    "IteratorAgeMilliseconds",
+    "ReadProvisionedThroughputExceeded",
+    "WriteProvisionedThroughputExceeded",
+  ] : []
+
   tags = {
     Name        = var.stream_name
     Environment = var.environment
     ManagedBy   = "Terraform"
   }
+}
+
+# ------------------------------------------------------------------------------
+# IDENTIFICADORES DE FRAGMENTO
+#
+# Kinesis nombra los shards de forma determinista al crear el stream:
+# shardId-000000000000, shardId-000000000001, ... Como este stream se crea con
+# un shard_count fijo y NO se reparte (no hay split ni merge), los nombres se
+# pueden derivar y usar como dimension de las alarmas.
+#
+# LIMITACION CONOCIDA: al hacer resharding, Kinesis cierra los shards padres y
+# crea hijos con identificadores nuevos y no contiguos. En ese escenario esta
+# derivacion deja de ser valida y habria que enumerar los fragmentos con un
+# data source o migrar a una alarma con expresion de busqueda de metricas.
+# ------------------------------------------------------------------------------
+locals {
+  shard_ids = [for i in range(var.shard_count) : format("shardId-%012d", i)]
 }
 
 # ------------------------------------------------------------------------------
@@ -208,6 +247,50 @@ resource "aws_cloudwatch_metric_alarm" "iterator_age" {
 
   dimensions = {
     StreamName = aws_kinesis_stream.main.name
+  }
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+
+# ------------------------------------------------------------------------------
+# ALARMA POR FRAGMENTO: ITERATOR AGE
+#
+# Complementa a la alarma agregada del stream. La diferencia importa: la
+# metrica agregada usa el maximo entre fragmentos y puede tardar en reaccionar
+# a un desbalance, mientras que estas alarmas identifican QUE shard concreto se
+# atraso, que es el primer dato que hace falta para diagnosticar.
+#
+# Causa tipica de un unico shard atrasado: una clave de particion mal
+# distribuida (hot shard). En ese escenario agregar fragmentos no resuelve
+# nada, porque el trafico seguiria cayendo en el mismo: hay que cambiar la
+# clave. Sin metricas por shard, ese diagnostico no es posible.
+#
+# Umbral igual al de la alarma agregada (60 s sostenidos durante 2 periodos),
+# para que ambas sean comparables.
+# ------------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "shard_iterator_age" {
+  for_each = var.enable_shard_level_metrics ? toset(local.shard_ids) : toset([])
+
+  alarm_name        = "kinesis-shard-lag-${var.stream_name}-${each.value}"
+  alarm_description = "El fragmento ${each.value} se atrasa respecto de la punta del stream"
+
+  namespace   = "AWS/Kinesis"
+  metric_name = "IteratorAgeMilliseconds" # nombre sin prefijo: es metrica de shard
+  statistic   = "Maximum"
+
+  period              = 60
+  evaluation_periods  = 2
+  threshold           = 60000
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    StreamName = aws_kinesis_stream.main.name
+    ShardId    = each.value
   }
 
   tags = {

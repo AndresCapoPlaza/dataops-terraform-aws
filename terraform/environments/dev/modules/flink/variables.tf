@@ -50,12 +50,24 @@ variable "enable_managed_flink" {
   type        = bool
   description = <<-EOT
     Despliega la aplicacion de Amazon Managed Service for Apache Flink.
-    Desactivada por defecto: este recurso factura por KPU-hora de forma
-    continua mientras existe (~USD 0,11/KPU-hora), y requiere que el artefacto
-    clicks_processor.zip este previamente subido a S3. La logica de
-    procesamiento se valida ejecutando el job localmente con PyFlink contra
-    el stream real de Kinesis.
+
+    Activada por defecto para que un unico `terraform apply` levante el stack
+    completo sin pasos manuales: Terraform sube el artefacto a S3 y crea la
+    aplicacion en el orden correcto.
+
+    ATENCION AL COSTO: este recurso factura por KPU-hora mientras existe
+    (~USD 0,11/KPU-hora, unos USD 80/mes si se deja corriendo). Para entornos
+    de estudio, ponerla en false o destruir el stack al terminar la sesion.
   EOT
-  default     = false
+  default     = true
+}
+
+variable "app_artifact_path" {
+  description = <<-EOT
+    Ruta local al .zip con el codigo de la aplicacion de Flink. Terraform lo
+    sube a S3 antes de crear la aplicacion, de modo que el despliegue no
+    requiere ninguna carga manual previa.
+  EOT
+  type        = string
 }
 

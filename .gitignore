@@ -63,3 +63,6 @@ _local/
 
 # Ningun JAR se versiona, esten donde esten
 **/*.jar
+
+# artefacto de build: se regenera con scripts/build_flink_zip.py
+flink-app/*.zip

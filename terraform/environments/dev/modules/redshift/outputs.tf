@@ -27,3 +27,13 @@ output "workgroup_endpoint" {
   description = "Endpoint del workgroup"
   value       = try(aws_redshiftserverless_workgroup.lakehouse.endpoint[0].address, null)
 }
+
+output "analyst_role_arn" {
+  description = "Rol IAM que obtiene credenciales temporales como analyst_user"
+  value       = try(aws_iam_role.analyst[0].arn, null)
+}
+
+output "refresh_schedule_name" {
+  description = "Planificador que ejecuta el REFRESH de la vista materializada"
+  value       = try(aws_scheduler_schedule.refresh_mv[0].name, null)
+}

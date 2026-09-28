@@ -61,3 +61,33 @@ variable "base_capacity" {
   description = "Capacidad base en RPUs (minimo 8)"
   default     = 8
 }
+
+variable "enable_scheduled_refresh" {
+  type        = bool
+  description = <<-EOT
+    Despliega el mecanismo operativo de refresco: EventBridge Scheduler que
+    invoca la Redshift Data API cada 60 segundos para ejecutar
+    REFRESH MATERIALIZED VIEW mv_clicks_stream_raw.
+
+    Se prefiere a AUTO REFRESH porque el intervalo es deterministico, esta
+    versionado en el repositorio y sus fallos emiten una metrica propia sobre
+    la que se alarma.
+
+    COSTO: cada refresco consume RPU-segundo de Redshift Serverless. Con un
+    refresco de ~2 s cada 60 s el ciclo util es de alrededor del 3 %, pero el
+    workgroup no llega a quedar inactivo. Desactivarlo si se deja el entorno
+    levantado sin trafico.
+  EOT
+  default     = true
+}
+
+variable "enable_analyst_iam_role" {
+  type        = bool
+  description = <<-EOT
+    Despliega el rol IAM que obtiene credenciales temporales para conectarse
+    como analyst_user. Es la contraparte de CREATE USER ... PASSWORD DISABLE:
+    sin este rol, el usuario existe sin contrasena y sin via declarada de
+    conexion.
+  EOT
+  default     = true
+}

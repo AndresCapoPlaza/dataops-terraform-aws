@@ -140,9 +140,35 @@ resource "aws_cloudwatch_log_stream" "flink_log_stream" {
 # Aplicación de Managed Service for Apache Flink
 # ============================================================
 
+
+# ------------------------------------------------------------------------------
+# ARTEFACTO DE LA APLICACION
+# Terraform sube el .zip a S3 como parte del despliegue. Sin esto, crear la
+# aplicacion exigiria un `aws s3 cp` manual previo y el stack dejaria de ser
+# reproducible con un unico `terraform apply`.
+# ------------------------------------------------------------------------------
+resource "aws_s3_object" "app_artifact" {
+  count = var.enable_managed_flink ? 1 : 0
+
+  bucket = var.code_bucket_name
+  key    = var.code_s3_key
+  source = var.app_artifact_path
+
+  # Fuerza la re-subida cuando cambia el contenido del artefacto
+  etag = filemd5(var.app_artifact_path)
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
 resource "aws_kinesisanalyticsv2_application" "clicks_processor" {
   # Controlado por var.enable_managed_flink (ver variables.tf)
   count = var.enable_managed_flink ? 1 : 0
+
+  # Garantiza que el .zip este en S3 antes de crear la aplicacion
+  depends_on = [aws_s3_object.app_artifact]
 
   name                   = "${var.app_name}-${var.environment}"
   runtime_environment    = "FLINK-1_15"
@@ -165,6 +191,25 @@ resource "aws_kinesisanalyticsv2_application" "clicks_processor" {
         property_group_id = "kinesis.analytics.flink.run.options"
         property_map = {
           python = "clicks_processor.py"
+
+          # HALLAZGO DE AUDITORIA (ver DAAT, seccion de analisis de fallos):
+          # esta aplicacion se despliega correctamente pero no llega a estado
+          # RUNNING. El job de PyFlink requiere el conector de Kinesis, que en
+          # Managed Flink no viene en el classpath. Se intento declararlo con
+          # la propiedad `jarfile` apuntando al JAR empaquetado dentro del zip
+          # (rutas normalizadas con "/" mediante scripts/build_flink_zip.py),
+          # pero el servicio sigue respondiendo:
+          #
+          #   InvalidArgumentException: We couldn't find the configured file
+          #   'lib/flink-sql-connector-kinesis-1.15.4.jar' in your zip file
+          #
+          # La propiedad queda documentada y desactivada para que el
+          # `terraform apply` complete sin errores. El procesamiento en
+          # streaming se ejecuta y evidencia con PyFlink local
+          # (flink-app/iceberg_processor.py), que escribe a Iceberg y es el
+          # job que sostiene el pipeline end-to-end de este proyecto.
+          #
+          # jarfile = "lib/flink-sql-connector-kinesis-1.15.4.jar"
         }
       }
 

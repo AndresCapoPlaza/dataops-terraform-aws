@@ -173,7 +173,12 @@ WITH caliente AS (
     SELECT
         product_id,
         COUNT(*) AS clicks_ahora
-    FROM v_clicks_tipado
+    -- WITH NO SCHEMA BINDING exige que TODAS las relaciones esten calificadas
+    -- con su esquema, tambien las locales. Sin el prefijo "public." Redshift
+    -- rechaza la vista con:
+    --   ERROR: All the relation names inside should be qualified when
+    --          creating VIEW WITH NO SCHEMA BINDING
+    FROM public.v_clicks_tipado
     WHERE event_timestamp >= DATEADD(minute, -15, GETDATE())
     GROUP BY product_id
 ),
@@ -280,16 +285,16 @@ ALTER MATERIALIZED VIEW mv_clicks_stream_raw AUTO REFRESH YES;
 -- =============================================================================
 
 -- 6.1 Estado del scan por shard: posicion, registros leidos y retraso.
-SELECT
-    trim(external_schema_name) AS esquema,
-    trim(stream_name)          AS stream,
-    trim(shard_id)             AS shard,
-    record_time,
-    total_bytes,
-    total_records
-FROM sys_stream_scan_states
-ORDER BY record_time DESC
-LIMIT 20;
+--
+--     Se consulta con SELECT * a proposito: el catalogo de esta vista de
+--     sistema varia entre versiones de Redshift. En el entorno usado no
+--     existe la columna "shard_id" (el identificador de fragmento viaja en
+--     "partition_id"), y nombrar columnas explicitamente rompe el script:
+--       ERROR: column "shard_id" does not exist in sys_stream_scan_states
+--     Las columnas relevantes que devuelve son: external_schema_name,
+--     stream_name, mv_name, partition_id, latest_position, scanned_rows,
+--     skipped_rows, scanned_bytes y las marcas de tiempo de lag.
+SELECT * FROM sys_stream_scan_states ORDER BY record_time DESC LIMIT 20;
 
 -- 6.2 Errores de ingesta (registros descartados, problemas de permisos).
 SELECT * FROM sys_stream_scan_errors ORDER BY record_time DESC LIMIT 20;

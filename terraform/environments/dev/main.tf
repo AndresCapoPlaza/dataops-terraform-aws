@@ -66,6 +66,10 @@ module "flink" {
   code_bucket_arn       = aws_s3_bucket.raw_bucket.arn
   code_bucket_name      = aws_s3_bucket.raw_bucket.bucket
   code_s3_key           = "flink/clicks_processor.zip"
+
+  # Terraform sube el artefacto a S3 antes de crear la aplicacion, de modo que
+  # el stack completo se levanta con un unico `terraform apply`.
+  app_artifact_path = "${path.root}/../../../flink-app/clicks_processor.zip"
   checkpoint_bucket_arn = aws_s3_bucket.raw_bucket.arn
   region                = "us-east-1"
 }

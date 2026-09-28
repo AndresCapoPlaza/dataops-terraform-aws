@@ -33,3 +33,20 @@ variable "buffer_interval_sec" {
   description = "Intervalo del buffer de Firehose en segundos"
   default     = 60
 }
+
+variable "enable_shard_level_metrics" {
+  type        = bool
+  description = <<-EOT
+    Habilita las metricas por fragmento (enhanced monitoring) del Kinesis Data
+    Stream y despliega una alarma de IteratorAge por cada shard.
+
+    POR QUE: las metricas agregadas del stream enmascaran un unico fragmento
+    atrasado. Sin desglose por ShardId no se puede distinguir un hot shard de
+    una saturacion general, y el diagnostico cambia por completo: el primero se
+    corrige cambiando la clave de particion, el segundo agregando fragmentos.
+
+    COSTO: se factura por metrica y por shard-hora. Con 2 shards es marginal;
+    escala de forma lineal con el numero de fragmentos.
+  EOT
+  default     = true
+}

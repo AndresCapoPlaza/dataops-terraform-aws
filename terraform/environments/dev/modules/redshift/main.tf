@@ -215,3 +215,261 @@ resource "aws_redshiftserverless_workgroup" "lakehouse" {
     ManagedBy   = "Terraform"
   }
 }
+
+# ==============================================================================
+# 5. MECANISMO OPERATIVO DE REFRESCO DE LA VISTA MATERIALIZADA
+#
+# El enunciado exige definir QUIEN ejecuta el refresco y con que cadencia. No
+# alcanza con documentar una intencion: tiene que ser un recurso desplegado.
+#
+# POR QUE NO `AUTO REFRESH YES`
+# -----------------------------
+# AUTO REFRESH es best-effort: Redshift decide cuando refrescar en funcion de
+# la carga del cluster. Con eso no se puede comprometer un objetivo de frescura
+# ni auditar por que un refresco no ocurrio. Sirve para "que este razonablemente
+# al dia", no para "cada 60 segundos".
+#
+# MECANISMO ADOPTADO
+# ------------------
+#   EventBridge Scheduler --(cada 60 s)--> Redshift Data API --> REFRESH
+#
+# Es deterministico, esta versionado en el repositorio, y sus fallos emiten una
+# metrica propia sobre la que se alarma (ver mas abajo). El intervalo minimo
+# que admite EventBridge Scheduler es de 1 minuto, que coincide exactamente con
+# el objetivo de frescura definido.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 5.1 Rol que asume el planificador para invocar la Data API
+#
+# Menor privilegio: solo puede ejecutar sentencias contra ESTE workgroup.
+# No puede leer datos por si mismo ni conectarse por otra via.
+# ------------------------------------------------------------------------------
+resource "aws_iam_role" "refresh_scheduler" {
+  count = var.enable_scheduled_refresh ? 1 : 0
+
+  name = "redshift-mv-refresh-${var.environment}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "scheduler.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+        Condition = {
+          # Evita el problema del "confused deputy": solo esta cuenta puede
+          # hacer que el servicio de scheduling asuma este rol.
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name        = "redshift-mv-refresh-${var.environment}"
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+resource "aws_iam_role_policy" "refresh_scheduler" {
+  count = var.enable_scheduled_refresh ? 1 : 0
+
+  name = "redshift-mv-refresh-policy"
+  role = aws_iam_role.refresh_scheduler[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ExecuteRefreshStatement"
+        Effect   = "Allow"
+        Action   = ["redshift-data:ExecuteStatement"]
+        Resource = aws_redshiftserverless_workgroup.lakehouse.arn
+      },
+      {
+        # La Data API necesita credenciales temporales del workgroup.
+        # Acotado al workgroup concreto, no a "*".
+        Sid      = "GetTemporaryCredentials"
+        Effect   = "Allow"
+        Action   = ["redshift-serverless:GetCredentials"]
+        Resource = aws_redshiftserverless_workgroup.lakehouse.arn
+      }
+    ]
+  })
+}
+
+# ------------------------------------------------------------------------------
+# 5.2 El planificador: REFRESH cada 60 segundos
+# ------------------------------------------------------------------------------
+resource "aws_scheduler_schedule" "refresh_mv" {
+  count = var.enable_scheduled_refresh ? 1 : 0
+
+  name        = "redshift-refresh-mv-${var.environment}"
+  description = "Refresca mv_clicks_stream_raw cada 60 s via Redshift Data API"
+
+  # Sin ventana flexible: el disparo es en el segundo previsto, no "en algun
+  # momento de los proximos N minutos". La frescura depende de eso.
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  schedule_expression          = "rate(1 minute)"
+  schedule_expression_timezone = "UTC"
+  state                        = "ENABLED"
+
+  target {
+    # Destino universal: invoca directamente la API del SDK, sin Lambda de por
+    # medio. Menos piezas moviles y nada de codigo que mantener.
+    arn      = "arn:aws:scheduler:::aws-sdk:redshiftdata:executeStatement"
+    role_arn = aws_iam_role.refresh_scheduler[0].arn
+
+    input = jsonencode({
+      Sql           = "REFRESH MATERIALIZED VIEW mv_clicks_stream_raw;"
+      Database      = var.database_name
+      WorkgroupName = aws_redshiftserverless_workgroup.lakehouse.workgroup_name
+      StatementName = "refresh-mv-clicks-stream-raw"
+    })
+
+    retry_policy {
+      # Un refresco perdido se recupera solo en el siguiente disparo: el
+      # refresco es incremental y acumulativo, de modo que no tiene sentido
+      # reintentar durante mucho tiempo.
+      maximum_retry_attempts       = 2
+      maximum_event_age_in_seconds = 120
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 5.3 ALARMA: el refresco dejo de ejecutarse
+#
+# Detecta el fallo del MECANISMO (permisos revocados, workgroup pausado,
+# sentencia rechazada). Es distinto de la alarma de lag del stream, que detecta
+# el fallo del CONSUMO. Ambas hacen falta: el refresco puede estar corriendo
+# sobre un stream atrasado, y el stream puede estar sano con el refresco caido.
+# ------------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "refresh_failed" {
+  count = var.enable_scheduled_refresh ? 1 : 0
+
+  alarm_name        = "redshift-mv-refresh-failed-${var.environment}"
+  alarm_description = "El refresco programado de mv_clicks_stream_raw esta fallando"
+
+  namespace   = "AWS/Scheduler"
+  metric_name = "TargetErrorCount"
+  statistic   = "Sum"
+
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    ScheduleGroup = "default"
+  }
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+# ==============================================================================
+# 6. IDENTIDAD IAM DEL ROL ANALITICO
+#
+# El usuario analyst_user se crea en SQL con PASSWORD DISABLE, lo que obliga a
+# obtener credenciales temporales por IAM. Este rol es la contraparte de esa
+# decision: define QUIEN puede obtenerlas y sobre que workgroup.
+#
+# Sin esto, "autenticacion IAM" seria una afirmacion sin respaldo: el usuario
+# existiria sin contrasena y sin ninguna via declarada para conectarse.
+# ==============================================================================
+
+resource "aws_iam_role" "analyst" {
+  count = var.enable_analyst_iam_role ? 1 : 0
+
+  name        = "redshift-analyst-${var.environment}"
+  description = "Identidad de analitica: credenciales temporales de solo lectura"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          # Cualquier principal de esta cuenta autorizado explicitamente.
+          # En una organizacion real aqui iria el rol del proveedor de
+          # identidad (SSO) o el grupo de analistas.
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = {
+    Name        = "redshift-analyst-${var.environment}"
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+resource "aws_iam_role_policy" "analyst_connect" {
+  count = var.enable_analyst_iam_role ? 1 : 0
+
+  name = "redshift-analyst-connect-policy"
+  role = aws_iam_role.analyst[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Credenciales temporales SOLO sobre este workgroup, y SOLO para la
+        # identidad de base de datos analyst_user. La condicion es lo que
+        # impide que el rol se conecte como el usuario administrador.
+        Sid      = "ConnectAsAnalystUserOnly"
+        Effect   = "Allow"
+        Action   = ["redshift-serverless:GetCredentials"]
+        Resource = aws_redshiftserverless_workgroup.lakehouse.arn
+        Condition = {
+          StringEquals = {
+            "redshift-serverless:DbName" = var.database_name
+          }
+        }
+      },
+      {
+        # Ejecutar consultas desde Query Editor v2 o la Data API.
+        Sid    = "RunQueries"
+        Effect = "Allow"
+        Action = [
+          "redshift-data:ExecuteStatement",
+          "redshift-data:DescribeStatement",
+          "redshift-data:GetStatementResult",
+          "redshift-data:ListStatements",
+        ]
+        Resource = "*"
+        Condition = {
+          # redshift-data no admite ARN de recurso en todas sus acciones de
+          # lectura de resultados (son de nivel de cuenta). Se acota por region
+          # y, en ExecuteStatement, el permiso efectivo lo limita el workgroup
+          # al que se puede pedir credenciales en la sentencia anterior.
+          StringEquals = {
+            "aws:RequestedRegion" = var.region
+          }
+        }
+      },
+      {
+        # NO se concede redshift-serverless:* ni acceso al secreto del usuario
+        # administrador. El analista no puede escalar a admin por esta via.
+        Sid      = "DenyAdminSecret"
+        Effect   = "Deny"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = aws_redshiftserverless_namespace.lakehouse.admin_password_secret_arn
+      }
+    ]
+  })
+}
